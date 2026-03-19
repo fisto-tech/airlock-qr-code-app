@@ -448,3 +448,61 @@ export const duplicateQRCode = async (req, res, next) => {
     next(error);
   }
 };
+
+/**
+ * @desc    Delete multiple QR codes
+ * @route   POST /api/qrcodes/bulk-delete
+ * @access  Private
+ */
+export const deleteManyQRCodes = async (req, res, next) => {
+  try {
+    const { ids } = req.body;
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No IDs provided'
+      });
+    }
+
+    const qrCodes = await QRCode.find({
+      _id: { $in: ids },
+      user: req.user.id
+    });
+
+    for (const qrCode of qrCodes) {
+      // Delete QR image file
+      if (qrCode.qrImagePath) {
+        try {
+          await fileService.deleteFile(qrCode.qrImagePath);
+        } catch (e) {
+          console.error(`Failed to delete file: ${qrCode.qrImagePath}`, e);
+        }
+      }
+
+      // Delete associated content and files
+      const content = await Content.findOne({ qrCode: qrCode._id });
+      if (content && content.file && content.file.path) {
+        try {
+          await fileService.deleteFile(content.file.path);
+        } catch (e) {
+          console.error(`Failed to delete content file: ${content.file.path}`, e);
+        }
+      }
+
+      // Delete content record
+      await Content.deleteOne({ qrCode: qrCode._id });
+      
+      // Delete QR code record
+      await qrCode.deleteOne();
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `${qrCodes.length} QR codes deleted successfully`
+    });
+  } catch (error) {
+    console.error('Delete Many QR Codes Error:', error);
+    next(error);
+  }
+};

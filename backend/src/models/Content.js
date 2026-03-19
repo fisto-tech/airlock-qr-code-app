@@ -9,7 +9,7 @@ const contentSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['url', 'vcard', 'text', 'file', 'multilink', 'wifi', 'email', 'sms', 'location'],
+    enum: ['url', 'vcard', 'text', 'file', 'multilink', 'wifi', 'email', 'sms', 'location', 'document', 'media'],
     required: true
   },
 
@@ -41,7 +41,8 @@ const contentSchema = new mongoose.Schema({
     },
     birthday: Date,
     notes: String,
-    photo: String
+    photo: String,
+    linkedin: String
   },
 
   // Text Content
@@ -118,8 +119,30 @@ const contentSchema = new mongoose.Schema({
     name: String,
     address: String,
     postalCode: String
+  },
+ 
+  // Document Content
+  document: {
+    url: String,
+    path: String,
+    fileName: String,
+    fileSize: Number,
+    mimeType: String,
+    fileType: String,
+    description: String
+  },
+ 
+  // Media Content
+  media: {
+    url: String,
+    path: String,
+    fileName: String,
+    fileSize: Number,
+    mimeType: String,
+    fileType: String,
+    description: String
   }
-
+ 
 }, {
   timestamps: true
 });

@@ -215,32 +215,94 @@ export const getDashboard = async (req, res, next) => {
     // Get scans for last 30 days
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    const recentScansData = await Scan.aggregate([
-      {
-        $match: {
-          qrCode: { $in: qrCodeIds },
-          createdAt: { $gte: thirtyDaysAgo }
+    const [recentScansData, recentScans, lastScansByQR, topLocations] = await Promise.all([
+      // Scans grouped by date for chart
+      Scan.aggregate([
+        {
+          $match: {
+            qrCode: { $in: qrCodeIds },
+            createdAt: { $gte: thirtyDaysAgo }
+          }
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+
+      // Recent scans with location for the feed
+      Scan.find({ qrCode: { $in: qrCodeIds } })
+        .sort({ createdAt: -1 })
+        .limit(15)
+        .populate('qrCode', 'title type')
+        .lean(),
+
+      // Last scan location per QR code (for card badges)
+      Scan.aggregate([
+        { $match: { qrCode: { $in: qrCodeIds } } },
+        { $sort: { createdAt: -1 } },
+        {
+          $group: {
+            _id: '$qrCode',
+            lastCity: { $first: '$location.city' },
+            lastCountry: { $first: '$location.country' },
+            lastCountryCode: { $first: '$location.countryCode' },
+            lastScannedAt: { $first: '$createdAt' }
+          }
         }
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { _id: 1 } }
+      ]),
+
+      // Top countries across all QRs (for analytics dashboard)
+      Scan.aggregate([
+        { $match: { qrCode: { $in: qrCodeIds }, 'location.country': { $nin: [null, 'Unknown', undefined] } } },
+        {
+          $group: {
+            _id: '$location.country',
+            countryCode: { $first: '$location.countryCode' },
+            count: { $sum: 1 },
+            cities: { $addToSet: '$location.city' }
+          }
+        },
+        { $sort: { count: -1 } },
+        { $limit: 10 }
+      ])
     ]);
 
-    // Top performing QR codes
-    const topQRCodes = qrCodes
+    // Build a map of qrId -> lastLocation for easy lookup (with safe defaults)
+    const locationByQR = {};
+    lastScansByQR.forEach(s => {
+      const city = s.lastCity && s.lastCity !== 'Unknown' ? s.lastCity : null;
+      const country = s.lastCountry && s.lastCountry !== 'Unknown' ? s.lastCountry : null;
+      const countryCode = s.lastCountryCode && s.lastCountryCode.length === 2 ? s.lastCountryCode : null;
+      if (city || country) {
+        locationByQR[s._id.toString()] = {
+          city,
+          country,
+          countryCode,
+          at: s.lastScannedAt
+        };
+      }
+    });
+
+    // Top performing QR codes with last scan location
+    const topQRCodes = [...qrCodes]
       .sort((a, b) => (b.scanCount || 0) - (a.scanCount || 0))
       .slice(0, 5)
       .map(qr => ({
         _id: qr._id,
         title: qr.title,
         scanCount: qr.scanCount || 0,
-        type: qr.type
+        type: qr.type,
+        lastScanLocation: locationByQR[qr._id.toString()] || null
       }));
+
+    // Location map for all QR cards
+    const qrLocationMap = Object.fromEntries(
+      Object.entries(locationByQR).map(([id, loc]) => [id, loc])
+    );
 
     res.status(200).json({
       success: true,
@@ -249,11 +311,83 @@ export const getDashboard = async (req, res, next) => {
         activeQRCodes,
         totalScans,
         recentScansData,
-        topQRCodes
+        topQRCodes,
+        recentScans,
+        qrLocationMap,
+        topLocations: topLocations.map(l => ({
+          country: l._id,
+          countryCode: l.countryCode && l.countryCode.length === 2 ? l.countryCode : null,
+          count: l.count,
+          cities: (l.cities || []).filter(c => c && c !== 'Unknown').slice(0, 3)
+        }))
       }
     });
   } catch (error) {
     console.error('Get Dashboard Error:', error);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get all scan locations for a specific QR code
+ * @route   GET /api/analytics/:qrCodeId/locations
+ * @access  Private
+ */
+export const getScanLocations = async (req, res, next) => {
+  try {
+    const { qrCodeId } = req.params;
+
+    const qrCode = await QRCode.findOne({ _id: qrCodeId, user: req.user.id });
+    if (!qrCode) {
+      return res.status(404).json({ success: false, message: 'QR code not found' });
+    }
+
+    const [scans, breakdown] = await Promise.all([
+      // Recent scans with location detail (up to 50)
+      Scan.find({ qrCode: qrCode._id })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .select('location device createdAt')
+        .lean(),
+
+      // Country breakdown for this QR
+      Scan.aggregate([
+        { $match: { qrCode: qrCode._id, 'location.country': { $nin: [null, 'Unknown', undefined] } } },
+        {
+          $group: {
+            _id: '$location.country',
+            countryCode: { $first: '$location.countryCode' },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { count: -1 } },
+        { $limit: 10 }
+      ])
+    ]);
+
+    // Sanitize scans — fill missing fields with null
+    const sanitizedScans = scans.map(s => ({
+      city: s.location?.city && s.location.city !== 'Unknown' ? s.location.city : null,
+      country: s.location?.country && s.location.country !== 'Unknown' ? s.location.country : null,
+      countryCode: s.location?.countryCode && s.location.countryCode.length === 2 ? s.location.countryCode : null,
+      browser: s.device?.browser || null,
+      os: s.device?.os || null,
+      deviceType: s.device?.type || 'unknown',
+      createdAt: s.createdAt
+    }));
+
+    res.status(200).json({
+      success: true,
+      data: {
+        scans: sanitizedScans,
+        breakdown: breakdown.map(b => ({
+          country: b._id,
+          countryCode: b.countryCode && b.countryCode.length === 2 ? b.countryCode : null,
+          count: b.count
+        }))
+      }
+    });
+  } catch (error) {
     next(error);
   }
 };

@@ -6,7 +6,8 @@ import {
   updateQRCode,
   deleteQRCode,
   downloadQRCode,
-  duplicateQRCode
+  duplicateQRCode,
+  deleteManyQRCodes
 } from '../controllers/qrCodeController.js';
 import { protect } from '../middleware/auth.js';
 
@@ -26,5 +27,6 @@ router.route('/:id')
 
 router.get('/:id/download', downloadQRCode);
 router.post('/:id/duplicate', duplicateQRCode);
+router.post('/bulk-delete', deleteManyQRCodes);
 
 export default router;

@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 
 class QRGeneratorService {
-  
+
   /**
    * Generate QR code with customization
    */
@@ -19,6 +19,7 @@ class QRGeneratorService {
       width = 1000,
       logo = null,
       dotStyle = 'square',
+      cornerStyle = 'square',
       frame = null
     } = customization;
 
@@ -36,9 +37,11 @@ class QRGeneratorService {
 
       let qrBuffer;
 
-      // Apply dot styling if not square
-      if (dotStyle !== 'square') {
-        qrBuffer = await this.applyDotStyle(content, qrOptions, dotStyle, foregroundColor, backgroundColor);
+      const cornerDotStyle = customization.cornerDotStyle || 'square';
+
+      // Apply dot styling if any custom styles are requested
+      if (dotStyle !== 'square' || cornerStyle !== 'square' || cornerDotStyle !== 'square') {
+        qrBuffer = await this.applyDotStyle(content, qrOptions, dotStyle, cornerStyle, cornerDotStyle, foregroundColor, backgroundColor);
       } else {
         qrBuffer = await QRCode.toBuffer(content, qrOptions);
       }
@@ -50,7 +53,7 @@ class QRGeneratorService {
         if (logoPath.startsWith('/uploads/')) {
           logoPath = fileService.getFullPath(logoPath.replace('/uploads/', ''));
         }
-        qrBuffer = await this.addLogo(qrBuffer, logoPath, logo.size || 0.25);
+        qrBuffer = await this.addLogo(qrBuffer, logoPath, logo, backgroundColor);
       }
 
       // Add frame if provided
@@ -68,16 +71,16 @@ class QRGeneratorService {
   /**
    * Apply custom dot styling to QR code
    */
-  async applyDotStyle(content, options, style, fgColor, bgColor) {
+  async applyDotStyle(content, options, dotStyle, cornerStyle, cornerDotStyle, fgColor, bgColor) {
     const qr = QRCode.create(content, options);
     const { modules } = qr;
     const { size, data } = modules;
-    
+
     // Calculate final image dimension
     const margin = options.margin || 4;
     const width = options.width || 1000;
     const moduleSize = width / (size + margin * 2);
-    
+
     const canvas = createCanvas(width, width);
     const ctx = canvas.getContext('2d');
 
@@ -89,15 +92,36 @@ class QRGeneratorService {
     ctx.fillStyle = fgColor;
     const offset = margin * moduleSize;
 
+    const isCorner = (row, col) => {
+      if (row < 7 && col < 7) return 'tl';
+      if (row < 7 && col >= size - 7) return 'tr';
+      if (row >= size - 7 && col < 7) return 'bl';
+      return null;
+    };
+
+    const drawnCorners = new Set();
+
     for (let row = 0; row < size; row++) {
       for (let col = 0; col < size; col++) {
         const isDark = data[row * size + col];
+        if (!isDark) continue;
 
-        if (isDark) {
-          const x = offset + col * moduleSize;
-          const y = offset + row * moduleSize;
-          this.drawModule(ctx, x, y, moduleSize, style);
+        const corner = isCorner(row, col);
+        if (corner) {
+          if (!drawnCorners.has(corner)) {
+            let cx = offset, cy = offset;
+            if (corner === 'tr') cx = offset + (size - 7) * moduleSize;
+            if (corner === 'bl') cy = offset + (size - 7) * moduleSize;
+
+            this.drawCorner(ctx, cx, cy, moduleSize * 7, cornerStyle, cornerDotStyle);
+            drawnCorners.add(corner);
+          }
+          continue;
         }
+
+        const x = offset + col * moduleSize;
+        const y = offset + row * moduleSize;
+        this.drawModule(ctx, x, y, moduleSize, dotStyle);
       }
     }
 
@@ -105,10 +129,34 @@ class QRGeneratorService {
   }
 
   /**
+   * Draw corner square
+   */
+  drawCorner(ctx, x, y, totalSize, style, dotStyle = 'square') {
+    const moduleSize = totalSize / 7;
+    // For 'dot' style in QRCustomizer, it means the entire eye is circular
+    const outerRadius = style === 'extra-rounded' ? totalSize * 0.3 : style === 'dot' ? totalSize * 0.45 : 0;
+    const innerPadding = moduleSize * 2;
+    const innerSize = totalSize - innerPadding * 2;
+    const innerRadius = dotStyle === 'extra-rounded' ? innerSize * 0.3 : dotStyle === 'dot' ? innerSize * 0.45 : 0;
+
+    // Draw outer frame
+    ctx.beginPath();
+    this.roundRectPath(ctx, x, y, totalSize, totalSize, outerRadius);
+    // Cut out the inner part of frame
+    this.roundRectPath(ctx, x + moduleSize, y + moduleSize, totalSize - moduleSize * 2, totalSize - moduleSize * 2, (outerRadius * 0.8) || 0, true);
+    ctx.fill();
+
+    // Draw inner dot
+    ctx.beginPath();
+    this.roundRectPath(ctx, x + innerPadding, y + innerPadding, innerSize, innerSize, innerRadius);
+    ctx.fill();
+  }
+
+  /**
    * Draw a single QR module with custom style
    */
   drawModule(ctx, x, y, size, style) {
-    const padding = size * 0.1;
+    const padding = size * 0.05; // Reduced padding for denser look
     const actualSize = size - padding * 2;
 
     switch (style) {
@@ -119,20 +167,59 @@ class QRGeneratorService {
         break;
 
       case 'rounded':
-        this.roundRect(ctx, x + padding, y + padding, actualSize, actualSize, actualSize * 0.3);
+        this.roundRect(ctx, x + padding, y + padding, actualSize, actualSize, actualSize * 0.4);
         break;
 
-      case 'classy':
-        this.roundRect(ctx, x + padding, y + padding, actualSize, actualSize, actualSize * 0.15);
+      case 'classy': {
+        const p = size * 0.05;
+        ctx.beginPath();
+        ctx.moveTo(x + size / 2, y + p);
+        ctx.lineTo(x + size - p, y + size / 2);
+        ctx.lineTo(x + size / 2, y + size - p);
+        ctx.lineTo(x + p, y + size / 2);
+        ctx.closePath();
+        ctx.fill();
         break;
+      }
 
       case 'extra-rounded':
         this.roundRect(ctx, x + padding, y + padding, actualSize, actualSize, actualSize * 0.5);
         break;
 
       default:
-        ctx.fillRect(x + padding, y + padding, actualSize, actualSize);
+        ctx.fillRect(x, y, size, size);
     }
+  }
+
+  /**
+   * Draw rounded rectangle path (for complex shapes)
+   */
+  roundRectPath(ctx, x, y, width, height, radius, counterClockwise = false) {
+    if (radius > width / 2) radius = width / 2;
+    if (radius > height / 2) radius = height / 2;
+
+    if (counterClockwise) {
+      ctx.moveTo(x + radius, y);
+      ctx.quadraticCurveTo(x, y, x, y + radius);
+      ctx.lineTo(x, y + height - radius);
+      ctx.quadraticCurveTo(x, y + height, x + radius, y + height);
+      ctx.lineTo(x + width - radius, y + height);
+      ctx.quadraticCurveTo(x + width, y + height, x + width, y + height - radius);
+      ctx.lineTo(x + width, y + radius);
+      ctx.quadraticCurveTo(x + width, y, x + width - radius, y);
+      ctx.lineTo(x + radius, y);
+    } else {
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + width - radius, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+      ctx.lineTo(x + width, y + height - radius);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      ctx.lineTo(x + radius, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+    }
+    ctx.closePath();
   }
 
   /**
@@ -140,29 +227,23 @@ class QRGeneratorService {
    */
   roundRect(ctx, x, y, width, height, radius) {
     ctx.beginPath();
-    ctx.moveTo(x + radius, y);
-    ctx.lineTo(x + width - radius, y);
-    ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
-    ctx.lineTo(x + width, y + height - radius);
-    ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
-    ctx.lineTo(x + radius, y + height);
-    ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
-    ctx.lineTo(x, y + radius);
-    ctx.quadraticCurveTo(x, y, x + radius, y);
-    ctx.closePath();
+    this.roundRectPath(ctx, x, y, width, height, radius);
     ctx.fill();
   }
 
   /**
    * Add logo to center of QR code
    */
-  async addLogo(qrBuffer, logoPath, logoSizeRatio) {
+  async addLogo(qrBuffer, logoPath, logoConfig, qrBackgroundColor = '#FFFFFF') {
     const qrImage = sharp(qrBuffer);
     const metadata = await qrImage.metadata();
     const qrSize = metadata.width;
 
+    const logoSizeRatio = typeof logoConfig === 'number' ? logoConfig : (logoConfig.size || 0.25);
+    const logoBgColor = logoConfig.backgroundColor || qrBackgroundColor || '#FFFFFF';
+    const logoBorderColor = logoConfig.borderColor || '#E2E8F0';
+
     const logoSize = Math.floor(qrSize * logoSizeRatio);
-    const logoPosition = Math.floor((qrSize - logoSize) / 2);
 
     // Load logo
     let logoBuffer;
@@ -176,33 +257,58 @@ class QRGeneratorService {
       logoBuffer = fs.readFileSync(logoPath);
     }
 
-    // Resize logo
-    const resizedLogo = await sharp(logoBuffer)
-      .resize(logoSize, logoSize, { 
-        fit: 'contain', 
-        background: { r: 0, g: 0, b: 0, alpha: 0 } 
+    // Get metadata for aspect ratio
+    const logoMeta = await sharp(logoBuffer).metadata();
+    const aspectRatio = logoMeta.width / logoMeta.height;
+
+    let targetW, targetH;
+    if (aspectRatio > 1) {
+      // Horizontal logo
+      targetW = logoSize;
+      targetH = Math.floor(logoSize / aspectRatio);
+    } else {
+      // Vertical or square logo
+      targetH = logoSize;
+      targetW = Math.floor(logoSize * aspectRatio);
+    }
+
+    // Process logo
+    const processedLogo = await sharp(logoBuffer)
+      .resize(targetW, targetH, {
+        fit: 'contain',
+        background: { r: 255, g: 255, b: 255, alpha: 0 }
       })
       .toBuffer();
 
-    // Create a clear background for logo (with optional padding)
-    const logoLayer = await sharp({
-      create: {
-        width: logoSize + 10,
-        height: logoSize + 10,
-        channels: 4,
-        background: { r: 255, g: 255, b: 255, alpha: 0 }
-      }
-    })
-      .composite([{ input: resizedLogo, left: 5, top: 5 }])
+    // Create a container that fits the logo aspect ratio
+    const margin = Math.floor(logoSize * 0.12);
+    const containerW = targetW + margin;
+    const containerH = targetH + margin;
+    const radius = Math.floor(Math.min(containerW, containerH) * 0.15);
+    const borderWidth = Math.max(2, Math.floor(Math.min(containerW, containerH) * 0.02));
+
+    const svgContainer = `
+      <svg width="${containerW}" height="${containerH}">
+        <rect x="${borderWidth/2}" y="${borderWidth/2}" width="${containerW-borderWidth}" height="${containerH-borderWidth}" 
+              rx="${radius}" ry="${radius}" 
+              fill="${logoBgColor !== 'transparent' ? logoBgColor : '#FFFFFF'}"
+              stroke="${logoBorderColor}" stroke-width="${borderWidth}"/>
+      </svg>
+    `;
+
+    const logoLayer = await sharp(Buffer.from(svgContainer))
+      .composite([{ input: processedLogo, gravity: 'center' }])
       .png()
       .toBuffer();
 
-    // Composite logo onto QR code
+    const logoLeft = Math.floor((qrSize - containerW) / 2);
+    const logoTop = Math.floor((qrSize - containerH) / 2);
+
     return await sharp(qrBuffer)
       .composite([{
         input: logoLayer,
-        left: logoPosition - 5,
-        top: logoPosition - 5
+        left: logoLeft,
+        top: logoTop
       }])
       .png()
       .toBuffer();
@@ -219,39 +325,51 @@ class QRGeneratorService {
     const qrSize = metadata.width;
 
     const padding = 50;
-    const textHeight = text ? 80 : 0;
-    const canvasWidth = qrSize + padding * 2;
-    const canvasHeight = qrSize + padding * 2 + textHeight;
+    const textHeight = text ? 100 : 0;
 
-    const canvas = createCanvas(canvasWidth, canvasHeight);
+    // To keep it square, we take the larger dimension
+    const baseSize = qrSize + padding * 2;
+    const canvasSize = baseSize + textHeight;
+
+    const canvas = createCanvas(canvasSize, canvasSize);
     const ctx = canvas.getContext('2d');
 
     // Draw background
     ctx.fillStyle = backgroundColor;
 
     if (style === 'rounded') {
-      this.roundRect(ctx, 0, 0, canvasWidth, canvasHeight, 20);
+      this.roundRect(ctx, 0, 0, canvasSize, canvasSize, canvasSize * 0.05);
     } else {
-      ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+      ctx.fillRect(0, 0, canvasSize, canvasSize);
     }
+
+    // Centering the QR code horizontally
+    const qrX = (canvasSize - qrSize) / 2;
+    // Keeping QR code at the top part (with padding)
+    const qrY = padding;
 
     // Draw QR code
     const qrImg = await loadImage(qrBuffer);
-    ctx.drawImage(qrImg, padding, padding, qrSize, qrSize);
+    ctx.drawImage(qrImg, qrX, qrY, qrSize, qrSize);
 
     // Draw text
     if (text) {
       ctx.fillStyle = textColor;
-      ctx.font = 'bold 36px Arial';
+      // Adjust font size based on canvas size
+      const fontSize = Math.floor(canvasSize * 0.04);
+      ctx.font = `bold ${fontSize}px Arial`;
       ctx.textAlign = 'center';
-      ctx.fillText(text, canvasWidth / 2, canvasHeight - 25);
+
+      // If banner style, text might be at the top. But usually it's at the bottom for these styles.
+      // Looking at the implementation, text was at the bottom.
+      ctx.fillText(text, canvasSize / 2, canvasSize - (padding + textHeight / 4));
     }
 
     // Add border for banner style
     if (style === 'banner') {
       ctx.strokeStyle = textColor;
-      ctx.lineWidth = 4;
-      ctx.strokeRect(10, 10, canvasWidth - 20, canvasHeight - 20);
+      ctx.lineWidth = Math.max(4, Math.floor(canvasSize * 0.01));
+      ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, canvasSize - ctx.lineWidth, canvasSize - ctx.lineWidth);
     }
 
     return canvas.toBuffer('image/png');
@@ -262,18 +380,18 @@ class QRGeneratorService {
    */
   async saveQRCode(qrBuffer, userId) {
     const qrDir = path.join(fileService.uploadsDir, 'qr-codes', userId);
-    
+
     if (!fs.existsSync(qrDir)) {
       fs.mkdirSync(qrDir, { recursive: true });
     }
 
     const fileName = `qr-${Date.now()}-${Math.random().toString(36).substring(7)}.png`;
     const filePath = path.join(qrDir, fileName);
-    
+
     fs.writeFileSync(filePath, qrBuffer);
 
     const relativePath = path.join('qr-codes', userId, fileName);
-    
+
     return {
       url: `/uploads/${relativePath.replace(/\\/g, '/')}`,
       path: relativePath.replace(/\\/g, '/'),
@@ -329,11 +447,16 @@ class QRGeneratorService {
 
     if (data.organization) vcard += `ORG:${data.organization}\n`;
     if (data.title) vcard += `TITLE:${data.title}\n`;
-    if (data.email) vcard += `EMAIL:${data.email}\n`;
-    if (data.phone) vcard += `TEL;TYPE=WORK:${data.phone}\n`;
-    if (data.mobile) vcard += `TEL;TYPE=CELL:${data.mobile}\n`;
-    if (data.fax) vcard += `TEL;TYPE=FAX:${data.fax}\n`;
+    if (data.email) vcard += `EMAIL;TYPE=INTERNET:${data.email || ''}\n`;
+    if (data.phone) vcard += `TEL;TYPE=VOICE:${data.phone || ''}\n`;
+    if (data.mobile) vcard += `TEL;TYPE=CELL,VOICE:${data.mobile || ''}\n`;
+    if (data.fax) vcard += `TEL;TYPE=FAX:${data.fax || ''}\n`;
     if (data.website) vcard += `URL:${data.website}\n`;
+    if (data.linkedin) {
+      vcard += `X-SOCIALPROFILE;TYPE=linkedin:${data.linkedin}\n`;
+      vcard += `X-LINKEDIN:${data.linkedin}\n`;
+      vcard += `URL:${data.linkedin}\n`;
+    }
 
     if (data.address) {
       const addr = data.address;

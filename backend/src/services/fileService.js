@@ -73,10 +73,19 @@ class FileService {
     let metadata = {};
 
     if (fileCategory === 'images') {
-      const result = await this.processImage(buffer);
-      buffer = result.buffer;
-      finalMimeType = 'image/webp';
-      metadata = result.metadata;
+      if (file.mimetype === 'image/gif') {
+        finalMimeType = 'image/gif';
+        try {
+          const image = sharp(buffer);
+          const meta = await image.metadata();
+          metadata = { width: meta.width, height: meta.height, format: 'gif' };
+        } catch(e) { metadata = {}; }
+      } else {
+        const result = await this.processImage(buffer);
+        buffer = result.buffer;
+        finalMimeType = 'image/webp';
+        metadata = result.metadata;
+      }
     }
 
     // Write file to disk

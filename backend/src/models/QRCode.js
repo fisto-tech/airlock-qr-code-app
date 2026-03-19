@@ -26,7 +26,7 @@ const qrCodeSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['url', 'vcard', 'text', 'file', 'multilink', 'wifi', 'email', 'sms', 'location'],
+    enum: ['url', 'vcard', 'text', 'file', 'multilink', 'wifi', 'email', 'sms', 'location', 'document', 'media'],
     required: true
   },
   isDynamic: {
@@ -58,7 +58,7 @@ const qrCodeSchema = new mongoose.Schema({
     },
     cornerDotStyle: {
       type: String,
-      enum: ['square', 'dot'],
+      enum: ['square', 'dot', 'extra-rounded'],
       default: 'square'
     },
     errorCorrectionLevel: {
@@ -79,7 +79,15 @@ const qrCodeSchema = new mongoose.Schema({
         type: Number,
         default: 0.25,
         min: 0.1,
-        max: 0.4
+        max: 0.6
+      },
+      backgroundColor: {
+        type: String,
+        default: '#FFFFFF'
+      },
+      borderColor: {
+        type: String,
+        default: '#E2E8F0'
       }
     },
     frame: {
@@ -114,6 +122,7 @@ const qrCodeSchema = new mongoose.Schema({
     endDate: Date,
     timezone: String
   },
+ 
   scanCount: {
     type: Number,
     default: 0

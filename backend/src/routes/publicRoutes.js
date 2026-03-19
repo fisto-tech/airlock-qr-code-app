@@ -12,7 +12,10 @@ const router = express.Router();
  */
 const trackScan = async (qrCodeId, req) => {
   try {
-    const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress || '';
+    const rawIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+      || req.ip
+      || req.connection?.remoteAddress
+      || '';
     const userAgent = req.headers['user-agent'] || '';
 
     // Parse user agent
@@ -21,19 +24,48 @@ const trackScan = async (qrCodeId, req) => {
     const browser = parser.getBrowser();
     const os = parser.getOS();
 
-    // Get geo location
-    const cleanIp = ip.replace('::ffff:', '').replace('::1', '');
-    const geo = geoip.lookup(cleanIp) || {};
+    // Clean IP (strip IPv6 prefix)
+    const cleanIp = rawIp.replace('::ffff:', '').replace(/^::1$/, '127.0.0.1').trim();
+
+    // Try geoip-lite first (works for public IPs)
+    let geo = geoip.lookup(cleanIp) || {};
+
+    // Fallback: ip-api.com for IPs geoip-lite can't resolve
+    // (Skip obviously private/loopback IPs — they can't be looked up externally either)
+    const isPrivate = !cleanIp
+      || cleanIp === '127.0.0.1'
+      || cleanIp.startsWith('192.168.')
+      || cleanIp.startsWith('10.')
+      || cleanIp.startsWith('172.');
+
+    if (!geo.country && !isPrivate) {
+      try {
+        const resp = await fetch(
+          `http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,regionName,city,lat,lon,timezone`,
+          { signal: AbortSignal.timeout(3000) }
+        );
+        const data = await resp.json();
+        if (data.status === 'success') {
+          geo = {
+            country: data.countryCode,
+            region: data.regionName,
+            city: data.city,
+            ll: [data.lat, data.lon],
+            timezone: data.timezone
+          };
+        }
+      } catch { /* ignore — analytics is non-critical */ }
+    }
 
     // Determine device type
     let deviceType = 'desktop';
     if (device.type === 'mobile') deviceType = 'mobile';
     else if (device.type === 'tablet') deviceType = 'tablet';
 
-    // Create scan record
+    // Create scan record — location may be empty for private IPs (browser GPS fills it later)
     await Scan.create({
       qrCode: qrCodeId,
-      ipAddress: ip,
+      ipAddress: cleanIp,
       userAgent,
       device: {
         type: deviceType,
@@ -43,13 +75,13 @@ const trackScan = async (qrCodeId, req) => {
         model: device.model
       },
       location: {
-        country: geo.country || 'Unknown',
-        countryCode: geo.country,
-        region: geo.region,
-        city: geo.city,
-        latitude: geo.ll?.[0],
-        longitude: geo.ll?.[1],
-        timezone: geo.timezone
+        country: geo.country || null,
+        countryCode: geo.country || null,
+        region: geo.region || null,
+        city: geo.city || null,
+        latitude: geo.ll?.[0] || null,
+        longitude: geo.ll?.[1] || null,
+        timezone: geo.timezone || null
       },
       referer: req.headers.referer,
       language: req.headers['accept-language']?.split(',')[0]
@@ -115,9 +147,9 @@ router.get('/:code', async (req, res) => {
       return res.redirect(content.url.target);
     }
 
-    // For file type with images/videos, redirect to the file URL
-    if (qrCode.type === 'file') {
-      const fileData = content.file;
+    // For file, document, or media type, redirect to the file URL
+    if (['file', 'document', 'media'].includes(qrCode.type)) {
+      const fileData = content[qrCode.type];
       if (fileData?.url) {
         return res.redirect(fileData.url);
       }
@@ -186,8 +218,16 @@ router.get('/:code', async (req, res) => {
             <div class="content">
               ${vc.email ? `<div class="field"><div class="label">Email</div><div class="value"><a href="mailto:${vc.email}">${vc.email}</a></div></div>` : ''}
               ${vc.phone ? `<div class="field"><div class="label">Phone</div><div class="value"><a href="tel:${vc.phone}">${vc.phone}</a></div></div>` : ''}
+              ${vc.mobile ? `<div class="field"><div class="label">Mobile</div><div class="value"><a href="tel:${vc.mobile}">${vc.mobile}</a></div></div>` : ''}
               ${vc.website ? `<div class="field"><div class="label">Website</div><div class="value"><a href="${vc.website}" target="_blank">${vc.website}</a></div></div>` : ''}
-              ${vc.organization ? `<div class="field"><div class="label">Organization</div><div class="value">${vc.organization}</div></div>` : ''}
+              ${vc.linkedin ? `<div class="field"><div class="label">LinkedIn</div><div class="value"><a href="${vc.linkedin}" target="_blank">${vc.linkedin}</a></div></div>` : ''}
+              ${vc.organization ? `<div class="field"><div class="label">Company</div><div class="value">${vc.organization}</div></div>` : ''}
+              <div style="padding-top: 25px; text-align: center;">
+                <a href="${process.env.BASE_URL}/scan/vcard/${qrCode.code}" 
+                   style="display: block; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px; font-weight: bold; text-decoration: none; box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);">
+                   Add to Contacts
+                </a>
+              </div>
             </div>
           </div>
         </body>
@@ -429,6 +469,107 @@ router.get('/:code/content', async (req, res) => {
       success: false,
       message: 'An error occurred'
     });
+  }
+});
+
+/**
+ * @desc    Serve VCard file
+ * @route   GET /api/public/vcard/:code
+ */
+router.get('/vcard/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const qrCode = await QRCode.findOne({ code, type: 'vcard' });
+    if (!qrCode) return res.status(404).send('Not found');
+
+    const content = await Content.findOne({ qrCode: qrCode._id });
+    if (!content || !content.vcard) return res.status(404).send('No contact info');
+
+    const vc = content.vcard;
+    let vcf = 'BEGIN:VCARD\nVERSION:3.0\n';
+    vcf += `FN:${vc.firstName || ''} ${vc.lastName || ''}\n`;
+    vcf += `N:${vc.lastName || ''};${vc.firstName || ''};;;\n`;
+    if (vc.organization) vcf += `ORG:${vc.organization}\n`;
+    if (vc.title) vcf += `TITLE:${vc.title}\n`;
+    if (vc.email) vcf += `EMAIL;TYPE=INTERNET:${vc.email}\n`;
+    if (vc.phone) vcf += `TEL;TYPE=VOICE:${vc.phone}\n`;
+    if (vc.mobile) vcf += `TEL;TYPE=CELL,VOICE:${vc.mobile}\n`;
+    if (vc.website) vcf += `URL:${vc.website}\n`;
+    if (vc.linkedin) {
+      vcf += `X-SOCIALPROFILE;TYPE=linkedin:${vc.linkedin}\n`;
+      vcf += `X-LINKEDIN:${vc.linkedin}\n`;
+      vcf += `URL;TYPE=WORK:${vc.linkedin}\n`;
+    }
+    if (vc.address?.street) {
+      vcf += `ADR;TYPE=WORK,POSTAL,PARCEL:;;${vc.address.street};${vc.address.city || ''};${vc.address.state || ''};${vc.address.zip || ''};${vc.address.country || ''}\n`;
+    }
+    vcf += 'END:VCARD';
+
+    res.setHeader('Content-Type', 'text/vcard');
+    res.setHeader('Content-Disposition', `attachment; filename="${vc.firstName || 'contact'}.vcf"`);
+    res.send(vcf);
+  } catch (error) {
+    res.status(500).send('Error');
+  }
+});
+
+/**
+ * @desc    Browser reports GPS location for the most recent scan of this QR code
+ * @route   POST /scan/:code/location
+ * @access  Public
+ */
+router.post('/:code/location', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const { latitude, longitude } = req.body;
+
+    if (!latitude || !longitude) return res.json({ success: false });
+
+    const qrCode = await QRCode.findOne({ code });
+    if (!qrCode) return res.json({ success: false });
+
+    // Reverse-geocode using OpenStreetMap Nominatim (free, no key needed)
+    let city = null, country = null, countryCode = null;
+    try {
+      const geoRes = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`,
+        {
+          headers: { 'User-Agent': 'QRApp/1.0' },
+          signal: AbortSignal.timeout(5000)
+        }
+      );
+      const geoData = await geoRes.json();
+      const addr = geoData.address || {};
+      city = addr.city || addr.town || addr.village || addr.county || null;
+      country = addr.country || null;
+      countryCode = addr.country_code?.toUpperCase() || null;
+    } catch { /* ignore reverse-geocode failure */ }
+
+    // Patch the most recent scan for this QR that lacks a real location
+    await Scan.findOneAndUpdate(
+      {
+        qrCode: qrCode._id,
+        $or: [
+          { 'location.country': null },
+          { 'location.country': { $exists: false } }
+        ]
+      },
+      {
+        $set: {
+          'location.latitude': latitude,
+          'location.longitude': longitude,
+          ...(city        && { 'location.city':        city }),
+          ...(country     && { 'location.country':     country }),
+          ...(countryCode && { 'location.countryCode': countryCode }),
+        }
+      },
+      { sort: { createdAt: -1 } }
+    );
+
+    res.json({ success: true, city, country, countryCode });
+  } catch (error) {
+    console.error('Location update error:', error);
+    res.json({ success: false });
   }
 });
 
