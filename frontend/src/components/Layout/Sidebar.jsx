@@ -53,7 +53,7 @@ const Sidebar = () => {
       <div className="flex items-center justify-between p-[1vw] border-b border-slate-700">
         <div className="flex items-center gap-[0.75vw]">
           <div className="w-[100%] h-auto flex items-center justify-center" >
-            <img src={logo} alt="Logo" className={`w-[${isExpanded ? '35%' : '100%'}] h-full object-cover`} />
+            <img src={logo} alt="Logo" className={`w-[${isExpanded ? '35%' : '50%'}] h-full object-cover`} />
           </div>
          
         </div>
