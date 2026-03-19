@@ -1,0 +1,435 @@
+import express from 'express';
+import QRCode from '../models/QRCode.js';
+import Content from '../models/Content.js';
+import Scan from '../models/Scan.js';
+import geoip from 'geoip-lite';
+import UAParser from 'ua-parser-js';
+
+const router = express.Router();
+
+/**
+ * Track scan analytics
+ */
+const trackScan = async (qrCodeId, req) => {
+  try {
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress || '';
+    const userAgent = req.headers['user-agent'] || '';
+
+    // Parse user agent
+    const parser = new UAParser(userAgent);
+    const device = parser.getDevice();
+    const browser = parser.getBrowser();
+    const os = parser.getOS();
+
+    // Get geo location
+    const cleanIp = ip.replace('::ffff:', '').replace('::1', '');
+    const geo = geoip.lookup(cleanIp) || {};
+
+    // Determine device type
+    let deviceType = 'desktop';
+    if (device.type === 'mobile') deviceType = 'mobile';
+    else if (device.type === 'tablet') deviceType = 'tablet';
+
+    // Create scan record
+    await Scan.create({
+      qrCode: qrCodeId,
+      ipAddress: ip,
+      userAgent,
+      device: {
+        type: deviceType,
+        browser: browser.name || 'Unknown',
+        os: os.name || 'Unknown',
+        vendor: device.vendor,
+        model: device.model
+      },
+      location: {
+        country: geo.country || 'Unknown',
+        countryCode: geo.country,
+        region: geo.region,
+        city: geo.city,
+        latitude: geo.ll?.[0],
+        longitude: geo.ll?.[1],
+        timezone: geo.timezone
+      },
+      referer: req.headers.referer,
+      language: req.headers['accept-language']?.split(',')[0]
+    });
+
+    // Update QR code scan count
+    await QRCode.findByIdAndUpdate(qrCodeId, {
+      $inc: { scanCount: 1 },
+      lastScannedAt: new Date()
+    });
+  } catch (error) {
+    console.error('Track scan error:', error);
+  }
+};
+
+/**
+ * @desc    Handle QR code scan
+ * @route   GET /scan/:code
+ * @access  Public
+ */
+router.get('/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    const qrCode = await QRCode.findOne({ code, isActive: true });
+
+    if (!qrCode) {
+      return res.status(404).json({
+        success: false,
+        message: 'QR code not found or inactive'
+      });
+    }
+
+    // Check scheduling
+    const now = new Date();
+    if (qrCode.scheduling) {
+      if (qrCode.scheduling.startDate && now < qrCode.scheduling.startDate) {
+        return res.status(403).json({
+          success: false,
+          message: 'This QR code is not yet active'
+        });
+      }
+      if (qrCode.scheduling.endDate && now > qrCode.scheduling.endDate) {
+        return res.status(403).json({
+          success: false,
+          message: 'This QR code has expired'
+        });
+      }
+    }
+
+    // Track scan
+    await trackScan(qrCode._id, req);
+
+    // Get content
+    const content = await Content.findOne({ qrCode: qrCode._id });
+
+    if (!content) {
+      return res.status(404).html('<h1>Content not found</h1>');
+    }
+
+    // For URL type, redirect
+    if (qrCode.type === 'url' && content.url?.target) {
+      return res.redirect(content.url.target);
+    }
+
+    // For file type with images/videos, redirect to the file URL
+    if (qrCode.type === 'file') {
+      const fileData = content.file;
+      if (fileData?.url) {
+        return res.redirect(fileData.url);
+      }
+    }
+
+    // Generate HTML for other content types
+    const contentData = content[qrCode.type];
+    let html = '';
+
+    if (qrCode.type === 'text') {
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>${qrCode.title || 'QR Content'}</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+            .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 10px; padding: 30px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+            h1 { color: #333; margin-top: 0; }
+            .content { background: #f5f5f5; padding: 20px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; color: #555; line-height: 1.6; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>${qrCode.title || 'Message'}</h1>
+            <div class="content">${contentData?.content || 'No content'}</div>
+          </div>
+        </body>
+        </html>
+      `;
+    } else if (qrCode.type === 'vcard') {
+      const vc = contentData || {};
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>${vc.firstName} ${vc.lastName}</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+            .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+            .header { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: white; padding: 40px 20px; text-align: center; }
+            .avatar { width: 100px; height: 100px; border-radius: 50%; background: white; margin: 0 auto 15px; display: flex; align-items: center; justify-content: center; font-size: 40px; font-weight: bold; }
+            .name { font-size: 24px; font-weight: bold; margin: 10px 0; }
+            .title { opacity: 0.9; font-size: 14px; }
+            .content { padding: 20px; }
+            .field { padding: 15px 0; border-bottom: 1px solid #eee; }
+            .field:last-child { border-bottom: none; }
+            .label { font-weight: 600; color: #667eea; font-size: 12px; text-transform: uppercase; }
+            .value { color: #333; margin-top: 5px; word-break: break-all; }
+            a { color: #667eea; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <div class="avatar">${(vc.firstName?.[0] || '') + (vc.lastName?.[0] || '')}</div>
+              <div class="name">${vc.firstName || ''} ${vc.lastName || ''}</div>
+              ${vc.title ? `<div class="title">${vc.title}</div>` : ''}
+              ${vc.organization ? `<div class="title">${vc.organization}</div>` : ''}
+            </div>
+            <div class="content">
+              ${vc.email ? `<div class="field"><div class="label">Email</div><div class="value"><a href="mailto:${vc.email}">${vc.email}</a></div></div>` : ''}
+              ${vc.phone ? `<div class="field"><div class="label">Phone</div><div class="value"><a href="tel:${vc.phone}">${vc.phone}</a></div></div>` : ''}
+              ${vc.website ? `<div class="field"><div class="label">Website</div><div class="value"><a href="${vc.website}" target="_blank">${vc.website}</a></div></div>` : ''}
+              ${vc.organization ? `<div class="field"><div class="label">Organization</div><div class="value">${vc.organization}</div></div>` : ''}
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+    } else if (qrCode.type === 'multilink') {
+      const ml = contentData || {};
+      const bgColor = ml.backgroundColor || '#f3f4f6';
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>${ml.title || 'Links'}</title>
+          <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: ${bgColor}; min-height: 100vh; padding: 20px; }
+            .container { max-width: 500px; margin: 0 auto; }
+            .profile { text-align: center; margin-bottom: 30px; background: white; border-radius: 16px; padding: 30px 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+            .avatar { width: 100px; height: 100px; border-radius: 50%; margin: 0 auto 15px; object-fit: cover; background: #e0e0e0; }
+            .title { font-size: 22px; font-weight: 700; color: #1a1a1a; margin: 10px 0 5px; }
+            .description { font-size: 14px; color: #666; line-height: 1.5; }
+            .links { display: flex; flex-direction: column; gap: 12px; }
+            .link { display: block; padding: 16px; border-radius: 12px; text-decoration: none; font-weight: 600; font-size: 16px; text-align: center; transition: all 0.3s ease; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .link:active { transform: scale(0.98); }
+            .socials { display: flex; justify-content: center; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+            .social-icon { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: white; text-decoration: none; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            .social-icon:active { transform: scale(0.95); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="profile">
+              ${ml.avatar ? `<img src="${ml.avatar}" alt="Avatar" class="avatar">` : ''}
+              <h1 class="title">${ml.title || 'My Links'}</h1>
+              ${ml.description ? `<p class="description">${ml.description}</p>` : ''}
+            </div>
+            <div class="links">
+              ${(ml.links || []).map(link => `
+                <a href="${link.url}" target="_blank" rel="noopener noreferrer" class="link" style="background-color: ${link.backgroundColor || '#3b82f6'}; color: ${link.textColor || '#fff'};">
+                  ${link.title}
+                </a>
+              `).join('')}
+            </div>
+            ${(ml.socialLinks && ml.socialLinks.length > 0) ? `
+              <div class="socials">
+                ${ml.socialLinks.map(social => `
+                  <a href="${social.url}" target="_blank" rel="noopener noreferrer" class="social-icon" title="${social.platform}">
+                    ${social.platform.charAt(0).toUpperCase()}
+                  </a>
+                `).join('')}
+              </div>
+            ` : ''}
+          </div>
+        </body>
+        </html>
+      `;
+    } else if (qrCode.type === 'email') {
+      const em = contentData || {};
+      const emailTo = [em.address, em.email, em.to].find(val => val && val !== 'undefined') || '';
+      const mailtoLink = `mailto:${emailTo}${em.subject ? '?subject=' + encodeURIComponent(em.subject) : ''}${em.body ? '&body=' + encodeURIComponent(em.body) : ''}`;
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Send Email</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+            .container { max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); text-align: center; }
+            h1 { color: #333; margin: 0 0 20px; }
+            .email-icon { font-size: 60px; margin-bottom: 20px; }
+            .info { color: #666; margin: 20px 0; font-size: 16px; }
+            .button { display: inline-block; margin-top: 30px; padding: 15px 40px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
+            .button:active { transform: scale(0.98); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="email-icon">✉️</div>
+            <h1>Send Email</h1>
+            <p class="info">To: <strong>${emailTo}</strong></p>
+            ${em.subject ? `<p class="info">Subject: <strong>${em.subject}</strong></p>` : ''}
+            <a href="${mailtoLink}" class="button">Open Email Client</a>
+          </div>
+        </body>
+        </html>
+      `;
+    } else if (qrCode.type === 'sms') {
+      const sm = contentData || {};
+      const smsLink = `sms:${sm.phone}${sm.message ? '?body=' + encodeURIComponent(sm.message) : ''}`;
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Send SMS</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #34d399 0%, #059669 100%); min-height: 100vh; }
+            .container { max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); text-align: center; }
+            h1 { color: #333; margin: 0 0 20px; }
+            .sms-icon { font-size: 60px; margin-bottom: 20px; }
+            .info { color: #666; margin: 20px 0; font-size: 16px; }
+            .button { display: inline-block; margin-top: 30px; padding: 15px 40px; background: linear-gradient(135deg, #34d399 0%, #059669 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
+            .button:active { transform: scale(0.98); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="sms-icon">💬</div>
+            <h1>Send SMS</h1>
+            <p class="info">Phone: <strong>${sm.phone}</strong></p>
+            ${sm.message ? `<p class="info">Message: <strong>${sm.message}</strong></p>` : ''}
+            <a href="${smsLink}" class="button">Open Messages</a>
+          </div>
+        </body>
+        </html>
+      `;
+    } else if (qrCode.type === 'wifi') {
+      const wifi = contentData || {};
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>WiFi Network</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); min-height: 100vh; }
+            .container { max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); text-align: center; }
+            h1 { color: #333; margin: 0 0 20px; }
+            .wifi-icon { font-size: 60px; margin-bottom: 20px; }
+            .info { color: #666; margin: 20px 0; font-size: 16px; word-break: break-all; }
+            .label { font-weight: 600; color: #0891b2; }
+            .button { display: inline-block; margin-top: 30px; padding: 15px 40px; background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
+            .button:active { transform: scale(0.98); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="wifi-icon">📶</div>
+            <h1>WiFi Network</h1>
+            <p class="info"><span class="label">Network:</span> ${wifi.ssid}</p>
+            <p class="info"><span class="label">Security:</span> ${wifi.encryption || 'WPA'}</p>
+            ${wifi.hidden ? '<p class="info"><span class="label">Hidden Network</span></p>' : ''}
+            <p style="font-size: 12px; color: #999; margin-top: 20px;">To connect: Open WiFi settings on your device and select "${wifi.ssid}"</p>
+          </div>
+        </body>
+        </html>
+      `;
+    } else if (qrCode.type === 'location') {
+      const loc = contentData || {};
+      const addressQuery = [loc.address, loc.postalCode].filter(Boolean).join(' ');
+      const mapsLink = `https://maps.google.com/?q=${encodeURIComponent(addressQuery)}`;
+      html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>${loc.name || 'Location'}</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #f97316 0%, #ea580c 100%); min-height: 100vh; }
+            .container { max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); text-align: center; }
+            h1 { color: #333; margin: 0 0 20px; }
+            .location-icon { font-size: 60px; margin-bottom: 20px; }
+            .info { color: #666; margin: 10px 0; font-size: 16px; word-break: break-word; }
+            .label { font-weight: 600; color: #ea580c; }
+            .button { display: inline-block; margin-top: 30px; padding: 15px 40px; background: linear-gradient(135deg, #f97316 0%, #ea580c 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
+            .button:active { transform: scale(0.98); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="location-icon">📍</div>
+            <h1>${loc.name || 'Location'}</h1>
+            ${loc.address ? `<p class="info"><span class="label">Address:</span> ${loc.address}</p>` : ''}
+            ${loc.postalCode ? `<p class="info"><span class="label">Postal Code:</span> ${loc.postalCode}</p>` : ''}
+            <a href="${mapsLink}" target="_blank" class="button">View on Google Maps</a>
+          </div>
+        </body>
+        </html>
+      `;
+    }
+
+    if (html) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.send(html);
+    }
+
+    // Fallback to JSON
+    res.status(200).json({
+      success: true,
+      type: qrCode.type,
+      title: qrCode.title,
+      data: contentData
+    });
+  } catch (error) {
+    console.error('Scan error:', error);
+    res.status(500).send('<h1>Error loading content</h1>');
+  }
+});
+
+/**
+ * @desc    Get QR code content for viewer
+ * @route   GET /scan/:code/content
+ * @access  Public
+ */
+router.get('/:code/content', async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    const qrCode = await QRCode.findOne({ code, isActive: true }).select('-user');
+
+    if (!qrCode) {
+      return res.status(404).json({
+        success: false,
+        message: 'QR code not found'
+      });
+    }
+
+    const content = await Content.findOne({ qrCode: qrCode._id });
+
+    res.status(200).json({
+      success: true,
+      qrCode: {
+        title: qrCode.title,
+        description: qrCode.description,
+        type: qrCode.type
+      },
+      content: content ? content[qrCode.type] : null
+    });
+  } catch (error) {
+    console.error('Get content error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'An error occurred'
+    });
+  }
+});
+
+export default router;
